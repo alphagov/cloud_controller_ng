@@ -6,7 +6,7 @@ module VCAP::CloudController
       end
 
       def create(request_attrs)
-        process = nil
+        app = nil
 
         AppModel.db.transaction do
           app = AppModel.create(
@@ -43,10 +43,10 @@ module VCAP::CloudController
 
           process.save
 
-          @access_validator.validate_access(:create, process, request_attrs)
+          @access_validator.validate_access(:create, app, request_attrs)
         end
 
-        process
+        app
       end
 
       private

@@ -1,8 +1,8 @@
 require 'spec_helper'
 
 module CloudController::Presenters::V2
-  RSpec.describe ProcessModelPresenter do
-    let(:app_presenter) { ProcessModelPresenter.new }
+  RSpec.describe AppModelPresenter do
+    let(:app_presenter) { AppModelPresenter.new }
     let(:controller) { 'controller' }
     let(:opts) { {} }
     let(:depth) { 'depth' }

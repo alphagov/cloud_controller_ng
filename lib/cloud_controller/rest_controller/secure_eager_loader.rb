@@ -58,6 +58,9 @@ module VCAP::CloudController::RestController
 
         unless association.link_only?
           if depth > 0
+            p '---------'
+            p "Model: #{model_class}"
+            p "Associated class: #{association_model_class.associated_class}"
             eager_load_hash[association_name] = {
               visibility_filter => build_eager_load_hash(
                 nil,

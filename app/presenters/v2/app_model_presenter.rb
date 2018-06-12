@@ -3,12 +3,14 @@ require 'presenters/helpers/censorship'
 module CloudController
   module Presenters
     module V2
-      class ProcessModelPresenter < BasePresenter
+      class AppModelPresenter < BasePresenter
         extend PresenterProvider
 
-        present_for_class 'VCAP::CloudController::ProcessModel'
+        present_for_class 'VCAP::CloudController::AppModel'
 
-        def entity_hash(controller, process, opts, depth, parents, orphans=nil)
+        def entity_hash(controller, app, opts, depth, parents, orphans=nil)
+          process = app.web_process
+
           entity = {
             'name'                       => process.name,
             'production'                 => process.production,
@@ -17,7 +19,7 @@ module CloudController
             'buildpack'                  => buildpack_name_or_url(process.buildpack),
             'detected_buildpack'         => process.detected_buildpack,
             'detected_buildpack_guid'    => process.detected_buildpack_guid,
-            'environment_json'           => redact(process.environment_json, can_read_env?(process)),
+            'environment_json'           => redact(process.environment_json, can_read_env?(app)),
             'memory'                     => process.memory,
             'instances'                  => process.instances,
             'disk_quota'                 => process.disk_quota,
@@ -65,8 +67,8 @@ module CloudController
           end
         end
 
-        def can_read_env?(process)
-          VCAP::CloudController::Security::AccessContext.new.can?(:read_env, process)
+        def can_read_env?(app)
+          VCAP::CloudController::Security::AccessContext.new.can?(:read_env, app)
         end
 
         def redact(attr, has_permission=false)

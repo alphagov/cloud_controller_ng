@@ -14,7 +14,7 @@ module VCAP::CloudController
           process.lock!
           app.lock!
 
-          @access_validator.validate_access(:read_for_update, process, request_attrs)
+          @access_validator.validate_access(:read_for_update, app, request_attrs)
 
           original_process_state = process.state
 
@@ -30,7 +30,7 @@ module VCAP::CloudController
           app.reload
           process.reload
 
-          @access_validator.validate_access(:update, process, request_attrs)
+          @access_validator.validate_access(:update, app, request_attrs)
 
           start_or_stop(app, request_attrs)
           prepare_to_stage(app) if staging_necessary?(process, request_attrs)

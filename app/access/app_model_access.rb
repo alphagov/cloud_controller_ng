@@ -1,5 +1,5 @@
 module VCAP::CloudController
-  class ProcessModelAccess < BaseAccess
+  class AppModelAccess < BaseAccess
     def read?(object)
       return @ok_read if instance_variable_defined?(:@ok_read)
       @ok_read = (admin_user? || admin_read_only_user? || global_auditor? || object_is_visible_to_user?(object, context.user))
@@ -64,7 +64,9 @@ module VCAP::CloudController
       return false unless create?(app, params)
       return true if params.nil?
 
-      if %w(instances memory disk_quota).any? { |k| params.key?(k) && params[k] != app.send(k.to_sym) }
+      web_process = app.web_process
+
+      if %w(instances memory disk_quota).any? { |k| params.key?(k) && params[k] != web_process.send(k.to_sym) }
         FeatureFlag.raise_unless_enabled!(:app_scaling)
       end
 

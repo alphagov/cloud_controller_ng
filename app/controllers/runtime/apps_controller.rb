@@ -8,11 +8,11 @@ require 'models/helpers/process_types'
 
 module VCAP::CloudController
   class AppsController < RestController::ModelController
-    model_class_name :ProcessModel
+    model_class_name :AppModel
     self.not_found_exception_name = 'AppNotFound'
 
     VCAP::CloudController.set_controller_for_model_name(
-      model_name: 'ProcessModel',
+      model_name: 'AppModel',
       controller: self
     )
 
@@ -57,7 +57,8 @@ module VCAP::CloudController
 
     def read_env(guid)
       FeatureFlag.raise_unless_enabled!(:env_var_visibility)
-      process = find_guid_and_validate_access(:read_env, guid, ProcessModel)
+      app = find_guid_and_validate_access(:read_env, guid)
+      process = app.web_process
       FeatureFlag.raise_unless_enabled!(:space_developer_env_var_visibility)
 
       vcap_application = VCAP::VarsBuilder.new(process).to_hash
@@ -126,7 +127,8 @@ module VCAP::CloudController
     end
 
     def delete(guid)
-      process = find_guid_and_validate_access(:delete, guid)
+      app = find_guid_and_validate_access(:delete, guid)
+      process = app.web_process
       space   = process.space
 
       if !recursive_delete? && process.service_bindings.present?
@@ -151,7 +153,8 @@ module VCAP::CloudController
     get '/v2/apps/:guid/droplet/download', :download_droplet
 
     def download_droplet(guid)
-      process = find_guid_and_validate_access(:read, guid)
+      app = find_guid_and_validate_access(:read, guid)
+      process = app.web_process
       blob_dispatcher.send_or_redirect(guid: process.current_droplet.try(:blobstore_key))
     rescue CloudController::Errors::BlobNotFound
       raise CloudController::Errors::ApiError.new_from_details('ResourceNotFound', "Droplet not found for app with guid #{process.guid}")
@@ -160,7 +163,8 @@ module VCAP::CloudController
     put '/v2/apps/:guid/droplet/upload', :upload_droplet
 
     def upload_droplet(guid)
-      process      = find_guid_and_validate_access(:update, guid)
+      app = find_guid_and_validate_access(:update, guid)
+      process = app.web_process
       droplet_path = @upload_handler.uploaded_file(request.POST, 'droplet')
 
       unless droplet_path
@@ -181,10 +185,10 @@ module VCAP::CloudController
     end
 
     def read(guid)
-      process = find_guid(guid)
-      raise CloudController::Errors::ApiError.new_from_details('AppNotFound', guid) unless process.web?
-      validate_access(:read, process)
-      object_renderer.render_json(self.class, process, @opts)
+      app = find_guid(guid)
+      raise CloudController::Errors::ApiError.new_from_details('AppNotFound', guid) unless app.web_process
+      validate_access(:read, app)
+      object_renderer.render_json(self.class, app, @opts)
     end
 
     private
@@ -197,12 +201,12 @@ module VCAP::CloudController
       BlobDispatcher.new(blobstore: @blobstore, controller: self)
     end
 
-    def before_update(app)
-      verify_enable_ssh(app.space)
+    def before_update(process)
+      verify_enable_ssh(process.space)
       updated_diego_flag = request_attrs['diego']
       ports              = request_attrs['ports']
       ignore_empty_ports! if ports == []
-      if should_warn_about_changed_ports?(app.diego, updated_diego_flag, ports)
+      if should_warn_about_changed_ports?(process.diego, updated_diego_flag, ports)
         add_warning('App ports have changed but are unknown. The app should now listen on the port specified by environment variable PORT.')
       end
     end
@@ -245,8 +249,8 @@ module VCAP::CloudController
       logger.debug 'cc.update', guid: guid, attributes: redact_attributes(:update, request_attrs)
       raise InvalidRequest unless request_attrs
 
-      process = find_guid(guid)
-      app     = process.app
+      app = find_guid(guid)
+      process = app.web_process
 
       before_update(process)
 
@@ -255,7 +259,7 @@ module VCAP::CloudController
 
       after_update(process)
 
-      [HTTP::CREATED, object_renderer.render_json(self.class, process, @opts)]
+      [HTTP::CREATED, object_renderer.render_json(self.class, app, @opts)]
     rescue PackageCreate::InvalidPackage => e
       unprocessable!(e.message)
     end
@@ -268,18 +272,20 @@ module VCAP::CloudController
       verify_enable_ssh(space)
 
       creator = V2::AppCreate.new(access_validator: self)
-      process = creator.create(request_attrs)
+      app = creator.create(request_attrs)
+
+      process = app.web_process
 
       @app_event_repository.record_app_create(
         process,
-        process.space,
+        app.space,
         user_audit_info,
         request_attrs)
 
       [
         HTTP::CREATED,
-        { 'Location' => "#{self.class.path}/#{process.guid}" },
-        object_renderer.render_json(self.class, process, @opts)
+        { 'Location' => "#{self.class.path}/#{app.guid}" },
+        object_renderer.render_json(self.class, app, @opts)
       ]
     rescue PackageCreate::InvalidPackage => e
       unprocessable!(e.message)
@@ -291,8 +297,9 @@ module VCAP::CloudController
       logger.debug 'cc.association.add', guid: app_guid, association: 'routes', other_guid: route_guid
       @request_attrs = { 'route' => route_guid, verb: 'add', relation: 'routes', related_guid: route_guid }
 
-      process = find_guid(app_guid, ProcessModel)
-      validate_access(:read_related_object_for_update, process, request_attrs)
+      app = find_guid(app_guid)
+      validate_access(:read_related_object_for_update, app, request_attrs)
+      process = app.web_process
 
       before_update(process)
 
@@ -312,7 +319,7 @@ module VCAP::CloudController
 
       after_update(process)
 
-      [HTTP::CREATED, object_renderer.render_json(self.class, process, @opts)]
+      [HTTP::CREATED, object_renderer.render_json(self.class, app, @opts)]
     end
 
     delete '/v2/apps/:app_guid/routes/:route_guid', :remove_route
@@ -321,8 +328,9 @@ module VCAP::CloudController
       logger.debug 'cc.association.remove', guid: app_guid, association: 'routes', other_guid: route_guid
       @request_attrs = { 'route' => route_guid, verb: 'remove', relation: 'routes', related_guid: route_guid }
 
-      process = find_guid(app_guid, ProcessModel)
-      validate_access(:can_remove_related_object, process, request_attrs)
+      app = find_guid(app_guid)
+      validate_access(:can_remove_related_object, app, request_attrs)
+      process = app.web_process
 
       before_update(process)
 
@@ -344,8 +352,9 @@ module VCAP::CloudController
       logger.debug 'cc.association.remove', guid: app_guid, association: 'service_bindings', other_guid: service_binding_guid
       @request_attrs = { 'service_binding' => service_binding_guid, verb: 'remove', relation: 'service_bindings', related_guid: service_binding_guid }
 
-      process = find_guid(app_guid, ProcessModel)
-      validate_access(:can_remove_related_object, process, request_attrs)
+      app = find_guid(app_guid)
+      validate_access(:can_remove_related_object, app, request_attrs)
+      process = app.web_process
 
       before_update(process)
 
@@ -362,7 +371,7 @@ module VCAP::CloudController
     get '/v2/apps/:guid/permissions', :permissions
 
     def permissions(guid)
-      find_guid_and_validate_access(:read_permissions, guid, ProcessModel)
+      find_guid_and_validate_access(:read_permissions, guid)
 
       [HTTP::OK, JSON.generate({
         read_sensitive_data: true,
@@ -370,7 +379,7 @@ module VCAP::CloudController
       })]
     rescue CloudController::Errors::ApiError => e
       if e.name == 'NotAuthorized'
-        process    = find_guid(guid, ProcessModel)
+        app    = find_guid(guid)
         membership = VCAP::CloudController::Membership.new(current_user)
 
         basic_access = [
@@ -379,7 +388,7 @@ module VCAP::CloudController
           VCAP::CloudController::Membership::ORG_MANAGER,
         ]
 
-        raise e unless membership.has_any_roles?(basic_access, process.space.guid, process.organization.guid)
+        raise e unless membership.has_any_roles?(basic_access, app.space.guid, app.organization.guid)
 
         [HTTP::OK, JSON.generate({
           read_sensitive_data: false,
@@ -395,7 +404,7 @@ module VCAP::CloudController
     end
 
     def filter_dataset(dataset)
-      dataset.where(type: ProcessTypes::WEB)
+      dataset.join(:processes, app_guid: :guid).where(type: ProcessTypes::WEB).select_all(:apps)
     end
 
     def unprocessable!(message)

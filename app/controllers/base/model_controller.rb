@@ -96,6 +96,7 @@ module VCAP::CloudController::RestController
         raise CloudController::Errors::ApiError.new_from_details('OrderByParameterInvalid', params['order-by'])
       end
 
+      p self.class
       collection_renderer.render_json(
         self.class,
         enumerate_dataset,

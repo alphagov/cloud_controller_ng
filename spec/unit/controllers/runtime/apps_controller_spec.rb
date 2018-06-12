@@ -5,10 +5,14 @@ module VCAP::CloudController
     let(:admin_user) { User.make }
     let(:non_admin_user) { User.make }
     let(:app_event_repository) { Repositories::AppEventRepository.new }
+    let(:app_model) { AppModel.make }
+
     before do
       set_current_user(non_admin_user)
       CloudController::DependencyLocator.instance.register(:app_event_repository, app_event_repository)
     end
+
+    #TODO: What happens if there is no web process!?
 
     describe 'Query Parameters' do
       it { expect(VCAP::CloudController::AppsController).to be_queryable_by(:name) }
@@ -19,7 +23,7 @@ module VCAP::CloudController
     end
 
     describe 'query by org_guid' do
-      let(:process) { ProcessModelFactory.make }
+      let(:process) { ProcessModelFactory.make(app: app_model) }
       it 'filters apps by org_guid' do
         set_current_user_as_admin
         get "/v2/apps?q=organization_guid:#{process.organization.guid}"
@@ -121,14 +125,15 @@ module VCAP::CloudController
 
         it 'does not return events with inline-relations-depth=0' do
           process = ProcessModel.make
-          get "/v2/apps/#{process.guid}?inline-relations-depth=0"
+          get "/v2/apps/#{app_model.guid}?inline-relations-depth=0"
           expect(entity).to have_key('events_url')
           expect(entity).to_not have_key('events')
         end
 
         it 'does not return events with inline-relations-depth=1 since app_events dataset is relatively expensive to query' do
-          process = ProcessModel.make
-          get "/v2/apps/#{process.guid}?inline-relations-depth=1"
+          ProcessModel.make(type: 'web', app: app_model)
+          get "/v2/apps/#{app_model.guid}?inline-relations-depth=1"
+          expect(last_response.status).to eq(200), last_response.body
           expect(entity).to have_key('events_url')
           expect(entity).to_not have_key('events')
         end
@@ -299,7 +304,7 @@ module VCAP::CloudController
         end
       end
 
-      it 'creates the app' do
+      it 'creates the app with the correct health check info' do
         request = {
           name:                       'maria',
           space_guid:                 space.guid,
@@ -313,9 +318,12 @@ module VCAP::CloudController
 
         post '/v2/apps', MultiJson.dump(request)
 
-        v2_app = ProcessModel.last
-        expect(v2_app.health_check_type).to eq('http')
-        expect(v2_app.health_check_http_endpoint).to eq('/healthz')
+        expect(last_response.status).to eq(201), last_response.body
+
+        app = AppModel.last
+        process = app.web_process
+        expect(process.health_check_type).to eq('http')
+        expect(process.health_check_http_endpoint).to eq('/healthz')
       end
 
       it 'creates the app' do
@@ -330,23 +338,23 @@ module VCAP::CloudController
 
         post '/v2/apps', MultiJson.dump(request)
 
-        v2_app = ProcessModel.last
-        expect(v2_app.name).to eq('maria')
-        expect(v2_app.space).to eq(space)
-        expect(v2_app.environment_json).to eq({ 'KEY' => 'val' })
-        expect(v2_app.stack).to eq(Stack.default)
-        expect(v2_app.buildpack.url).to eq('http://example.com/buildpack')
+        app = AppModel.last
+        process = app.web_process
+        expect(process.name).to eq('maria')
+        expect(process.space).to eq(space)
+        expect(process.environment_json).to eq({ 'KEY' => 'val' })
+        expect(process.stack).to eq(Stack.default)
+        expect(process.buildpack.url).to eq('http://example.com/buildpack')
 
-        v3_app = v2_app.app
-        expect(v3_app.name).to eq('maria')
-        expect(v3_app.space).to eq(space)
-        expect(v3_app.environment_variables).to eq({ 'KEY' => 'val' })
-        expect(v3_app.lifecycle_type).to eq(BuildpackLifecycleDataModel::LIFECYCLE_TYPE)
-        expect(v3_app.lifecycle_data.stack).to eq(Stack.default.name)
-        expect(v3_app.lifecycle_data.buildpacks).to eq(['http://example.com/buildpack'])
-        expect(v3_app.desired_state).to eq(v2_app.state)
+        expect(app.name).to eq('maria')
+        expect(app.space).to eq(space)
+        expect(app.environment_variables).to eq({ 'KEY' => 'val' })
+        expect(app.lifecycle_type).to eq(BuildpackLifecycleDataModel::LIFECYCLE_TYPE)
+        expect(app.lifecycle_data.stack).to eq(Stack.default.name)
+        expect(app.lifecycle_data.buildpacks).to eq(['http://example.com/buildpack'])
+        expect(app.desired_state).to eq(process.state)
 
-        expect(v3_app.guid).to eq(v2_app.guid)
+        expect(app.guid).to eq(process.guid)
       end
 
       context 'creating a buildpack app' do
@@ -560,7 +568,7 @@ module VCAP::CloudController
     describe 'update app' do
       let(:update_hash) { {} }
 
-      let(:process) { ProcessModelFactory.make(diego: false, instances: 1) }
+      let(:process) { ProcessModelFactory.make(diego: false, instances: 1, app: app_model) }
       let(:developer) { make_developer_for_space(process.space) }
 
       before do
@@ -573,7 +581,7 @@ module VCAP::CloudController
           before { FeatureFlag.make(name: 'app_scaling', enabled: true) }
 
           it 'allows updating memory' do
-            put "/v2/apps/#{process.guid}", '{ "memory": 2 }'
+            put "/v2/apps/#{app_model.guid}", '{ "memory": 2 }'
             expect(last_response.status).to eq(201)
           end
         end
@@ -582,7 +590,7 @@ module VCAP::CloudController
           before { FeatureFlag.make(name: 'app_scaling', enabled: false, error_message: nil) }
 
           it 'fails with the proper error code and message' do
-            put "/v2/apps/#{process.guid}", '{ "memory": 2 }'
+            put "/v2/apps/#{app_model.guid}", '{ "memory": 2 }'
             expect(last_response.status).to eq(403)
             expect(decoded_response['error_code']).to match(/FeatureDisabled/)
             expect(decoded_response['description']).to match(/app_scaling/)
@@ -591,14 +599,14 @@ module VCAP::CloudController
       end
 
       context 'switch from dea to diego' do
-        let(:process) { ProcessModelFactory.make(instances: 1, diego: false, type: 'web') }
+        let(:process) { ProcessModelFactory.make(instances: 1, diego: false, type: 'web', app: app_model) }
         let(:developer) { make_developer_for_space(process.space) }
         let(:route) { Route.make(space: process.space) }
         let(:route_mapping) { RouteMappingModel.make(app: process.app, route: route) }
 
         it 'sets ports to 8080' do
           expect(process.ports).to be_nil
-          put "/v2/apps/#{process.guid}", '{ "diego": true }'
+          put "/v2/apps/#{app_model.guid}", '{ "diego": true }'
           expect(last_response.status).to eq(201)
           expect(decoded_response['entity']['ports']).to match([8080])
           expect(decoded_response['entity']['diego']).to be true
@@ -606,9 +614,9 @@ module VCAP::CloudController
       end
 
       context 'switch from diego to dea' do
-        let(:process) { ProcessModelFactory.make(instances: 1, diego: true, ports: [8080, 5222]) }
+        let(:process) { ProcessModelFactory.make(instances: 1, diego: true, ports: [8080, 5222], app: app_model) }
         it 'updates the backend of the app and returns 201 with warning' do
-          put "/v2/apps/#{process.guid}", '{ "diego": false}'
+          put "/v2/apps/#{app_model.guid}", '{ "diego": false}'
           expect(last_response).to have_status_code(201)
           expect(decoded_response['entity']['diego']).to be false
           warning = CGI.unescape(last_response.headers['X-Cf-Warnings'])
@@ -617,10 +625,10 @@ module VCAP::CloudController
       end
 
       context 'when app is diego app' do
-        let(:process) { ProcessModelFactory.make(instances: 1, diego: true, ports: [9090, 5222]) }
+        let(:process) { ProcessModelFactory.make(instances: 1, diego: true, ports: [9090, 5222], app: app_model) }
 
         it 'sets ports to user specified values' do
-          put "/v2/apps/#{process.guid}", '{ "ports": [1883,5222] }'
+          put "/v2/apps/#{app_model.guid}", '{ "ports": [1883,5222] }'
           expect(last_response.status).to eq(201)
           expect(decoded_response['entity']['ports']).to match([1883, 5222])
           expect(decoded_response['entity']['diego']).to be true
@@ -628,7 +636,7 @@ module VCAP::CloudController
 
         context 'when not updating ports' do
           it 'should keep previously specified custom ports' do
-            put "/v2/apps/#{process.guid}", '{ "instances":2 }'
+            put "/v2/apps/#{app_model.guid}", '{ "instances":2 }'
             expect(last_response.status).to eq(201)
             expect(decoded_response['entity']['ports']).to match([9090, 5222])
             expect(decoded_response['entity']['diego']).to be true
@@ -637,7 +645,7 @@ module VCAP::CloudController
 
         context 'when the user sets ports to an empty array' do
           it 'should keep previously specified custom ports' do
-            put "/v2/apps/#{process.guid}", '{ "ports":[] }'
+            put "/v2/apps/#{app_model.guid}", '{ "ports":[] }'
             expect(last_response.status).to eq(201)
             expect(decoded_response['entity']['ports']).to match([9090, 5222])
             expect(decoded_response['entity']['diego']).to be true
@@ -651,7 +659,7 @@ module VCAP::CloudController
 
           context 'when new app ports contains all existing route port mappings' do
             it 'updates the ports' do
-              put "/v2/apps/#{process.guid}", '{ "ports":[9090, 5222, 1234] }'
+              put "/v2/apps/#{app_model.guid}", '{ "ports":[9090, 5222, 1234] }'
               expect(last_response.status).to eq(201)
               expect(decoded_response['entity']['ports']).to match([9090, 5222, 1234])
             end
@@ -659,7 +667,7 @@ module VCAP::CloudController
 
           context 'when new app ports partially contains existing route port mappings' do
             it 'returns 400' do
-              put "/v2/apps/#{process.guid}", '{ "ports":[5222, 1234] }'
+              put "/v2/apps/#{app_model.guid}", '{ "ports":[5222, 1234] }'
               expect(last_response.status).to eq(400)
               expect(decoded_response['description']).to include('App ports ports may not be removed while routes are mapped to them.')
             end
@@ -667,7 +675,7 @@ module VCAP::CloudController
 
           context 'when new app ports do not contain existing route mapping port' do
             it 'returns 400' do
-              put "/v2/apps/#{process.guid}", '{ "ports":[1234] }'
+              put "/v2/apps/#{app_model.guid}", '{ "ports":[1234] }'
               expect(last_response.status).to eq(400)
               expect(decoded_response['description']).to include('App ports ports may not be removed while routes are mapped to them.')
             end
@@ -690,7 +698,7 @@ module VCAP::CloudController
               expect(attributes).to eq({ 'instances' => 2 })
             end
 
-            put "/v2/apps/#{process.guid}", MultiJson.dump(update_hash)
+            put "/v2/apps/#{app_model.guid}", MultiJson.dump(update_hash)
           end
         end
 
@@ -701,7 +709,7 @@ module VCAP::CloudController
           end
 
           it 'does not record app update' do
-            put "/v2/apps/#{process.guid}", MultiJson.dump(update_hash)
+            put "/v2/apps/#{app_model.guid}", MultiJson.dump(update_hash)
 
             expect(app_event_repository).to_not have_received(:record_app_update)
             expect(last_response.status).to eq(500)
@@ -710,8 +718,8 @@ module VCAP::CloudController
       end
 
       it 'updates the app' do
-        v2_app = ProcessModel.make
-        v3_app = v2_app.app
+        process = ProcessModel.make
+        app_model = process.app
         stack  = Stack.make(name: 'stack-name')
 
         request = {
@@ -723,22 +731,22 @@ module VCAP::CloudController
 
         set_current_user(admin_user, admin: true)
 
-        put "/v2/apps/#{v2_app.guid}", MultiJson.dump(request)
+        put "/v2/apps/#{app_model.guid}", MultiJson.dump(request)
         expect(last_response.status).to eq(201)
 
-        v2_app.reload
-        v3_app.reload
+        process.reload
+        app_model.reload
 
-        expect(v2_app.name).to eq('maria')
-        expect(v2_app.environment_json).to eq({ 'KEY' => 'val' })
-        expect(v2_app.stack).to eq(stack)
-        expect(v2_app.buildpack.url).to eq('http://example.com/buildpack')
+        expect(process.name).to eq('maria')
+        expect(process.environment_json).to eq({ 'KEY' => 'val' })
+        expect(process.stack).to eq(stack)
+        expect(process.buildpack.url).to eq('http://example.com/buildpack')
 
-        expect(v3_app.name).to eq('maria')
-        expect(v3_app.environment_variables).to eq({ 'KEY' => 'val' })
-        expect(v3_app.lifecycle_type).to eq(BuildpackLifecycleDataModel::LIFECYCLE_TYPE)
-        expect(v3_app.lifecycle_data.stack).to eq('stack-name')
-        expect(v3_app.lifecycle_data.buildpacks).to eq(['http://example.com/buildpack'])
+        expect(app_model.name).to eq('maria')
+        expect(app_model.environment_variables).to eq({ 'KEY' => 'val' })
+        expect(app_model.lifecycle_type).to eq(BuildpackLifecycleDataModel::LIFECYCLE_TYPE)
+        expect(app_model.lifecycle_data.stack).to eq('stack-name')
+        expect(app_model.lifecycle_data.buildpacks).to eq(['http://example.com/buildpack'])
       end
 
       context 'when custom buildpacks are disabled and the buildpack attribute is being changed' do
@@ -748,17 +756,17 @@ module VCAP::CloudController
           process.app.lifecycle_data.update(buildpacks: [Buildpack.make.name])
         end
 
-        let(:process) { ProcessModel.make }
+        let(:process) { ProcessModel.make(app: app_model) }
 
         it 'does NOT allow a public git url' do
-          put "/v2/apps/#{process.guid}", MultiJson.dump({ buildpack: 'http://example.com/buildpack' })
+          put "/v2/apps/#{app_model.guid}", MultiJson.dump({ buildpack: 'http://example.com/buildpack' })
 
           expect(last_response.status).to eq(400)
           expect(last_response.body).to include('Custom buildpacks are disabled')
         end
 
         it 'does NOT allow a public http url' do
-          put "/v2/apps/#{process.guid}", MultiJson.dump({ buildpack: 'http://example.com/foo' })
+          put "/v2/apps/#{app_model.guid}", MultiJson.dump({ buildpack: 'http://example.com/foo' })
 
           expect(last_response.status).to eq(400)
           expect(last_response.body).to include('Custom buildpacks are disabled')
@@ -766,20 +774,20 @@ module VCAP::CloudController
 
         it 'does allow a buildpack name' do
           admin_buildpack = Buildpack.make
-          put "/v2/apps/#{process.guid}", MultiJson.dump({ buildpack: admin_buildpack.name })
+          put "/v2/apps/#{app_model.guid}", MultiJson.dump({ buildpack: admin_buildpack.name })
 
           expect(last_response.status).to eq(201)
         end
 
         it 'does not allow a private git url' do
-          put "/v2/apps/#{process.guid}", MultiJson.dump({ buildpack: 'git@example.com:foo.git' })
+          put "/v2/apps/#{app_model.guid}", MultiJson.dump({ buildpack: 'git@example.com:foo.git' })
 
           expect(last_response.status).to eq(400)
           expect(last_response.body).to include('Custom buildpacks are disabled')
         end
 
         it 'does not allow a private git url with ssh schema' do
-          put "/v2/apps/#{process.guid}", MultiJson.dump({ buildpack: 'ssh://git@example.com:foo.git' })
+          put "/v2/apps/#{app_model.guid}", MultiJson.dump({ buildpack: 'ssh://git@example.com:foo.git' })
 
           expect(last_response.status).to eq(400)
           expect(last_response.body).to include('Custom buildpacks are disabled')
@@ -796,23 +804,24 @@ module VCAP::CloudController
 
           expect(process.stack).not_to eq(new_stack)
 
-          put "/v2/apps/#{process.guid}", MultiJson.dump({ stack_guid: new_stack.guid })
+          put "/v2/apps/#{app_model.guid}", MultiJson.dump({ stack_guid: new_stack.guid })
 
           expect(last_response.status).to eq(201)
-          expect(process.reload.stack).to eq(new_stack)
+          expect(app_model.reload.stack).to eq(new_stack)
         end
 
         context 'when the app is already staged' do
           let(:process) do
             ProcessModelFactory.make(
               instances: 1,
+              app: app_model,
               state:     'STARTED')
           end
 
           it 'marks the app for re-staging' do
             expect(process.needs_staging?).to eq(false)
 
-            put "/v2/apps/#{process.guid}", MultiJson.dump({ stack_guid: new_stack.guid })
+            put "/v2/apps/#{app_model.guid}", MultiJson.dump({ stack_guid: new_stack.guid })
             expect(last_response.status).to eq(201)
             process.reload
 
@@ -822,7 +831,7 @@ module VCAP::CloudController
         end
 
         context 'when the app needs staged' do
-          let(:process) { ProcessModelFactory.make(state: 'STARTED') }
+          let(:process) { ProcessModelFactory.make(state: 'STARTED', app: app_model) }
 
           before do
             PackageModel.make(app: process.app, package_hash: 'some-hash', state: PackageModel::READY_STATE)
@@ -833,7 +842,7 @@ module VCAP::CloudController
             expect(process.staged?).to be false
             expect(process.needs_staging?).to be true
 
-            put "/v2/apps/#{process.guid}", MultiJson.dump({ stack_guid: new_stack.guid })
+            put "/v2/apps/#{app_model.guid}", MultiJson.dump({ stack_guid: new_stack.guid })
             expect(last_response.status).to eq(201)
             process.reload
 
@@ -843,13 +852,13 @@ module VCAP::CloudController
         end
 
         context 'when the app was never staged' do
-          let(:process) { ProcessModel.make }
+          let(:process) { ProcessModel.make(app: app_model) }
 
           it 'does not mark the app for staging' do
             expect(process.staged?).to be_falsey
             expect(process.needs_staging?).to be_nil
 
-            put "/v2/apps/#{process.guid}", MultiJson.dump({ stack_guid: new_stack.guid })
+            put "/v2/apps/#{app_model.guid}", MultiJson.dump({ stack_guid: new_stack.guid })
             expect(last_response.status).to eq(201)
             process.reload
 
@@ -861,26 +870,28 @@ module VCAP::CloudController
 
       describe 'changing lifecycle types' do
         context 'when changing from docker to buildpack' do
-          let(:process) { ProcessModel.make(app: AppModel.make(:docker)) }
+          let(:app_model) { AppModel.make(:docker) }
+          let(:process) { ProcessModel.make(app: app_model) }
 
           it 'raises an error setting buildpack' do
-            put "/v2/apps/#{process.guid}", MultiJson.dump({ buildpack: 'https://buildpack.example.com' })
+            put "/v2/apps/#{app_model.guid}", MultiJson.dump({ buildpack: 'https://buildpack.example.com' })
             expect(last_response.status).to eq(400)
             expect(last_response.body).to include('Lifecycle type cannot be changed')
           end
 
           it 'raises an error setting stack' do
-            put "/v2/apps/#{process.guid}", MultiJson.dump({ stack_guid: 'phat-stackz' })
+            put "/v2/apps/#{app_model.guid}", MultiJson.dump({ stack_guid: 'phat-stackz' })
             expect(last_response.status).to eq(400)
             expect(last_response.body).to include('Lifecycle type cannot be changed')
           end
         end
 
         context 'when changing from buildpack to docker' do
-          let(:process) { ProcessModel.make(app: AppModel.make(:buildpack)) }
+          let(:app_model) { AppModel.make(:buildpack) }
+          let(:process) { ProcessModel.make(app: app_model) }
 
           it 'raises an error' do
-            put "/v2/apps/#{process.guid}", MultiJson.dump({ docker_image: 'repo/great-image' })
+            put "/v2/apps/#{app_model.guid}", MultiJson.dump({ docker_image: 'repo/great-image' })
             expect(last_response.status).to eq(400)
             expect(last_response.body).to include('Lifecycle type cannot be changed')
           end
@@ -893,12 +904,13 @@ module VCAP::CloudController
         end
 
         it 'creates a new docker package' do
-          process          = ProcessModelFactory.make(app: AppModel.make(:docker), docker_image: 'repo/original-image')
+          app_model = AppModel.make(:docker)
+          process          = ProcessModelFactory.make(app: app_model, docker_image: 'repo/original-image')
           original_package = process.latest_package
 
           expect(process.docker_image).not_to eq('repo/new-image')
 
-          put "/v2/apps/#{process.guid}", MultiJson.dump({ docker_image: 'repo/new-image' })
+          put "/v2/apps/#{app_model.guid}", MultiJson.dump({ docker_image: 'repo/new-image' })
           expect(last_response.status).to eq(201)
 
           parsed_response = MultiJson.load(last_response.body)
@@ -917,12 +929,13 @@ module VCAP::CloudController
           end
 
           it 'creates a new docker package with those credentials' do
-            process          = ProcessModelFactory.make(app: AppModel.make(:docker), docker_image: 'repo/original-image')
+            app_model = AppModel.make(:docker)
+            process          = ProcessModelFactory.make(app: app_model, docker_image: 'repo/original-image')
             original_package = process.latest_package
 
             expect(process.docker_image).not_to eq('repo/new-image')
 
-            put "/v2/apps/#{process.guid}", MultiJson.dump({ docker_image: 'repo/new-image', docker_credentials: docker_credentials })
+            put "/v2/apps/#{app_model.guid}", MultiJson.dump({ docker_image: 'repo/new-image', docker_credentials: docker_credentials })
             expect(last_response.status).to eq(201)
 
             parsed_response = MultiJson.load(last_response.body)
@@ -957,7 +970,7 @@ module VCAP::CloudController
 
       describe 'staging' do
         let(:app_stage) { instance_double(V2::AppStage, stage: nil) }
-        let(:process) { ProcessModelFactory.make }
+        let(:process) { ProcessModelFactory.make(app: app_model) }
 
         before do
           allow(V2::AppStage).to receive(:new).and_return(app_stage)
@@ -974,7 +987,7 @@ module VCAP::CloudController
             end
 
             it 'requests to be staged' do
-              put "/v2/apps/#{process.guid}", req
+              put "/v2/apps/#{app_model.guid}", req
               expect(last_response.status).to eq(201)
 
               expect(app_stage).to have_received(:stage)
@@ -983,7 +996,7 @@ module VCAP::CloudController
 
           context 'when the app does not need staging' do
             it 'does not request to be staged' do
-              put "/v2/apps/#{process.guid}", req
+              put "/v2/apps/#{app_model.guid}", req
               expect(last_response.status).to eq(201)
 
               expect(app_stage).not_to have_received(:stage)
@@ -1001,7 +1014,7 @@ module VCAP::CloudController
             end
 
             it 'does not request to be staged' do
-              put "/v2/apps/#{process.guid}", req
+              put "/v2/apps/#{app_model.guid}", req
               expect(last_response.status).to eq(201)
 
               expect(app_stage).not_to have_received(:stage)
@@ -1010,7 +1023,7 @@ module VCAP::CloudController
 
           context 'when the app does not need staging' do
             it 'does not request to be staged' do
-              put "/v2/apps/#{process.guid}", req
+              put "/v2/apps/#{app_model.guid}", req
               expect(last_response.status).to eq(201)
 
               expect(app_stage).not_to have_received(:stage)
@@ -1020,32 +1033,32 @@ module VCAP::CloudController
       end
 
       context 'when starting an app without a package' do
-        let(:process) { ProcessModel.make(instances: 1) }
+        let(:process) { ProcessModel.make(instances: 1, app: app_model) }
 
         it 'raises an error' do
-          put "/v2/apps/#{process.guid}", MultiJson.dump({ state: 'STARTED' })
+          put "/v2/apps/#{app_model.guid}", MultiJson.dump({ state: 'STARTED' })
           expect(last_response.status).to eq(400)
           expect(last_response.body).to include('bits have not been uploaded')
         end
       end
 
       describe 'starting and stopping' do
-        let(:parent_app) { process.app }
-        let(:process) { ProcessModelFactory.make(instances: 1, state: state) }
-        let(:sibling) { ProcessModel.make(instances: 1, state: state, app: parent_app, type: 'worker') }
+        let(:app_model) { AppModel.make(desired_state: state) }
+        let(:process) { ProcessModelFactory.make(instances: 1, state: state, app: app_model) }
+        let(:sibling) { ProcessModel.make(instances: 1, state: state, app: app_model, type: 'worker') }
 
         context 'starting' do
           let(:state) { 'STOPPED' }
 
           it 'is reflected in the parent app and all sibling processes' do
-            expect(parent_app.desired_state).to eq('STOPPED')
+            expect(app_model.desired_state).to eq('STOPPED')
             expect(process.state).to eq('STOPPED')
             expect(sibling.state).to eq('STOPPED')
 
-            put "/v2/apps/#{process.guid}", '{ "state": "STARTED" }'
+            put "/v2/apps/#{app_model.guid}", '{ "state": "STARTED" }'
             expect(last_response.status).to eq(201)
 
-            expect(parent_app.reload.desired_state).to eq('STARTED')
+            expect(app_model.reload.desired_state).to eq('STARTED')
             expect(process.reload.state).to eq('STARTED')
             expect(sibling.reload.state).to eq('STARTED')
           end
@@ -1055,14 +1068,14 @@ module VCAP::CloudController
           let(:state) { 'STARTED' }
 
           it 'is reflected in the parent app and all sibling processes' do
-            expect(parent_app.desired_state).to eq('STARTED')
+            expect(app_model.desired_state).to eq('STARTED')
             expect(process.state).to eq('STARTED')
             expect(sibling.state).to eq('STARTED')
 
-            put "/v2/apps/#{process.guid}", '{ "state": "STOPPED" }'
+            put "/v2/apps/#{app_model.guid}", '{ "state": "STOPPED" }'
             expect(last_response.status).to eq(201)
 
-            expect(parent_app.reload.desired_state).to eq('STOPPED')
+            expect(app_model.reload.desired_state).to eq('STOPPED')
             expect(process.reload.state).to eq('STOPPED')
             expect(sibling.reload.state).to eq('STOPPED')
           end
@@ -1072,7 +1085,7 @@ module VCAP::CloudController
           let(:state) { 'STOPPED' }
 
           it 'raises an error' do
-            put "/v2/apps/#{process.guid}", '{ "state": "ohio" }'
+            put "/v2/apps/#{app_model.guid}", '{ "state": "ohio" }'
             expect(last_response.status).to eq(400)
             expect(last_response.body).to include('Invalid app state')
           end
@@ -1081,7 +1094,7 @@ module VCAP::CloudController
     end
 
     describe 'delete an app' do
-      let(:process) { ProcessModelFactory.make }
+      let(:process) { ProcessModelFactory.make(app: app_model) }
       let(:developer) { make_developer_for_space(process.space) }
       let(:decoded_response) { MultiJson.load(last_response.body) }
       let(:parent_app) { process.app }
@@ -1091,7 +1104,7 @@ module VCAP::CloudController
       end
 
       def delete_app
-        delete "/v2/apps/#{process.guid}"
+        delete "/v2/apps/#{app_model.guid}"
       end
 
       it 'deletes the app' do
@@ -1100,7 +1113,7 @@ module VCAP::CloudController
 
         delete_app
 
-        expect(last_response.status).to eq(204)
+        expect(last_response.status).to eq(204), last_response.body
         expect(process.exists?).to be_falsey
         expect(parent_app.exists?).to be_falsey
       end
@@ -1142,7 +1155,7 @@ module VCAP::CloudController
           end
 
           it 'should succeed on a recursive delete' do
-            delete "/v2/apps/#{process.guid}?recursive=true"
+            delete "/v2/apps/#{app_model.guid}?recursive=true"
 
             expect(last_response).to have_status_code(204)
           end
@@ -1163,7 +1176,7 @@ module VCAP::CloudController
         end
 
         it 'records the recursive query parameter when recursive' do
-          delete "/v2/apps/#{process.guid}?recursive=true"
+          delete "/v2/apps/#{app_model.guid}?recursive=true"
 
           event = Event.find(type: 'audit.app.delete-request', actee_type: 'app')
           expect(event.type).to eq('audit.app.delete-request')
@@ -1196,7 +1209,7 @@ module VCAP::CloudController
 
       context 'GET' do
         it 'returns the route mapping' do
-          get "/v2/apps/#{process.guid}/route_mappings"
+          get "/v2/apps/#{app_model.guid}/route_mappings"
           expect(last_response.status).to eql(200)
           parsed_body = parse(last_response.body)
           expect(parsed_body['resources'].first['entity']['route_guid']).to eq(route.guid)
@@ -1206,21 +1219,21 @@ module VCAP::CloudController
 
       context 'POST' do
         it 'returns 404' do
-          post "/v2/apps/#{process.guid}/route_mappings", '{}'
+          post "/v2/apps/#{app_model.guid}/route_mappings", '{}'
           expect(last_response.status).to eql(404)
         end
       end
 
       context 'PUT' do
         it 'returns 404' do
-          put "/v2/apps/#{process.guid}/route_mappings/#{route_mapping.guid}", '{}'
+          put "/v2/apps/#{app_model.guid}/route_mappings/#{route_mapping.guid}", '{}'
           expect(last_response.status).to eql(404)
         end
       end
 
       context 'DELETE' do
         it 'returns 404' do
-          delete "/v2/apps/#{process.guid}/route_mappings/#{route_mapping.guid}"
+          delete "/v2/apps/#{app_model.guid}/route_mappings/#{route_mapping.guid}"
           expect(last_response.status).to eql(404)
         end
       end
@@ -1230,7 +1243,7 @@ module VCAP::CloudController
       let(:space) { process.space }
       let(:developer) { make_developer_for_space(space) }
       let(:auditor) { make_auditor_for_space(space) }
-      let(:process) { ProcessModelFactory.make(detected_buildpack: 'buildpack-name') }
+      let(:process) { ProcessModelFactory.make(detected_buildpack: 'buildpack-name', app: app_model) }
       let(:decoded_response) { MultiJson.load(last_response.body) }
 
       before do
@@ -1244,7 +1257,7 @@ module VCAP::CloudController
           end
 
           it 'returns a JSON payload indicating they do not have permission to read this endpoint' do
-            get "/v2/apps/#{process.guid}/env"
+            get "/v2/apps/#{app_model.guid}/env"
             expect(last_response.status).to eql(403)
             expect(JSON.parse(last_response.body)['description']).to eql('You are not authorized to perform the requested action')
           end
@@ -1256,7 +1269,7 @@ module VCAP::CloudController
           end
 
           it 'returns successfully' do
-            get "/v2/apps/#{process.guid}/env"
+            get "/v2/apps/#{app_model.guid}/env"
             expect(last_response.status).to eql(200)
             parsed_body = parse(last_response.body)
             expect(parsed_body).to have_key('staging_env_json')
@@ -1269,7 +1282,7 @@ module VCAP::CloudController
 
         context 'environment variable' do
           it 'returns application environment with VCAP_APPLICATION' do
-            get "/v2/apps/#{process.guid}/env"
+            get "/v2/apps/#{app_model.guid}/env"
             expect(last_response.status).to eql(200)
 
             expect(decoded_response['application_env_json']).to have_key('VCAP_APPLICATION')
@@ -1301,7 +1314,7 @@ module VCAP::CloudController
           let!(:service_binding) { ServiceBinding.make(app: process.app, service_instance: service_instance) }
 
           it 'returns system environment with VCAP_SERVICES' do
-            get "/v2/apps/#{process.guid}/env"
+            get "/v2/apps/#{app_model.guid}/env"
             expect(last_response.status).to eql(200)
 
             expect(decoded_response['system_env_json']['VCAP_SERVICES']).not_to eq({})
@@ -1315,7 +1328,7 @@ module VCAP::CloudController
             end
 
             it 'does not include the binding in VCAP_SERVICES' do
-              get "/v2/apps/#{process.guid}/env"
+              get "/v2/apps/#{app_model.guid}/env"
               expect(last_response.status).to eql(200)
 
               expect(decoded_response['system_env_json']['VCAP_SERVICES']).to eq({})
@@ -1331,7 +1344,7 @@ module VCAP::CloudController
           end
 
           it 'returns staging_env_json with those variables' do
-            get "/v2/apps/#{process.guid}/env"
+            get "/v2/apps/#{app_model.guid}/env"
             expect(last_response.status).to eql(200)
 
             expect(decoded_response['staging_env_json'].size).to eq(1)
@@ -1348,7 +1361,7 @@ module VCAP::CloudController
           end
 
           it 'returns staging_env_json with those variables' do
-            get "/v2/apps/#{process.guid}/env"
+            get "/v2/apps/#{app_model.guid}/env"
             expect(last_response.status).to eql(200)
 
             expect(decoded_response['running_env_json'].size).to eq(1)
@@ -1363,7 +1376,7 @@ module VCAP::CloudController
           end
 
           it 'returns InsufficientScope' do
-            get "/v2/apps/#{process.guid}/env"
+            get "/v2/apps/#{app_model.guid}/env"
             expect(last_response.status).to eql(403)
             expect(JSON.parse(last_response.body)['description']).to eql('Your token lacks the necessary scopes to access this resource.')
           end
@@ -1376,7 +1389,7 @@ module VCAP::CloudController
         end
 
         it 'should not be able to read environment variables' do
-          get "/v2/apps/#{process.guid}/env"
+          get "/v2/apps/#{app_model.guid}/env"
           expect(last_response.status).to eql(403)
           expect(JSON.parse(last_response.body)['description']).to eql('You are not authorized to perform the requested action')
         end
@@ -1397,7 +1410,7 @@ module VCAP::CloudController
         context 'when the user is a space developer' do
           it 'returns non-redacted environment values' do
             get '/v2/apps?inline-relations-depth=2'
-            expect(last_response.status).to eql(200)
+            expect(last_response.status).to eql(200), last_response.body
 
             expect(decoded_response['resources'].first['entity']['environment_json']).to eq(test_environment_json)
             expect(decoded_response).not_to have_key('system_env_json')
@@ -1420,14 +1433,14 @@ module VCAP::CloudController
       end
 
       context 'when the user is NOT a member of the space this instance exists in' do
-        let(:process) { ProcessModelFactory.make(detected_buildpack: 'buildpack-name') }
+        let(:process) { ProcessModelFactory.make(detected_buildpack: 'buildpack-name', app: app_model) }
 
         before do
           set_current_user(User.make)
         end
 
         it 'returns access denied' do
-          get "/v2/apps/#{process.guid}/env"
+          get "/v2/apps/#{app_model.guid}/env"
           expect(last_response.status).to eql(403)
         end
       end
@@ -1436,7 +1449,7 @@ module VCAP::CloudController
         let(:developer) { nil }
 
         it 'returns an error saying that the user is not authenticated' do
-          get "/v2/apps/#{process.guid}/env"
+          get "/v2/apps/#{app_model.guid}/env"
           expect(last_response.status).to eq(401)
         end
       end
@@ -1454,7 +1467,7 @@ module VCAP::CloudController
         end
 
         it 'raises 403 for non-admins' do
-          get "/v2/apps/#{process.guid}/env"
+          get "/v2/apps/#{app_model.guid}/env"
 
           expect(last_response.status).to eq(403)
           expect(last_response.body).to include('FeatureDisabled')
@@ -1463,14 +1476,14 @@ module VCAP::CloudController
 
         it 'succeeds for admins' do
           set_current_user_as_admin
-          get "/v2/apps/#{process.guid}/env"
+          get "/v2/apps/#{app_model.guid}/env"
 
           expect(last_response.status).to eq(200)
         end
 
         it 'succeeds for admin_read_onlys' do
           set_current_user_as_admin_read_only
-          get "/v2/apps/#{process.guid}/env"
+          get "/v2/apps/#{app_model.guid}/env"
 
           expect(last_response.status).to eq(200)
         end
@@ -1481,7 +1494,7 @@ module VCAP::CloudController
           end
 
           it 'indicates they do not have permission rather than that the feature flag is disabled' do
-            get "/v2/apps/#{process.guid}/env"
+            get "/v2/apps/#{app_model.guid}/env"
             expect(last_response.status).to eql(403)
             expect(JSON.parse(last_response.body)['description']).to eql('You are not authorized to perform the requested action')
           end
@@ -1495,7 +1508,7 @@ module VCAP::CloudController
 
         it 'raises 403 all user' do
           set_current_user_as_admin
-          get "/v2/apps/#{process.guid}/env"
+          get "/v2/apps/#{app_model.guid}/env"
 
           expect(last_response.status).to eq(403)
           expect(last_response.body).to include('Feature Disabled: env_var_visibility')
@@ -1508,7 +1521,7 @@ module VCAP::CloudController
 
           it 'raises 403 for non-admins' do
             set_current_user(developer)
-            get "/v2/apps/#{process.guid}/env"
+            get "/v2/apps/#{app_model.guid}/env"
 
             expect(last_response.status).to eq(403)
             expect(last_response.body).to include('Feature Disabled: env_var_visibility')
@@ -1523,7 +1536,7 @@ module VCAP::CloudController
 
         it 'continues to show 403 for roles that never had access to envs' do
           set_current_user(auditor)
-          get "/v2/apps/#{process.guid}/env"
+          get "/v2/apps/#{app_model.guid}/env"
 
           expect(last_response.status).to eq(403)
           expect(last_response.body).to include('NotAuthorized')
@@ -1531,7 +1544,7 @@ module VCAP::CloudController
 
         it 'show envs for admins' do
           set_current_user_as_admin
-          get "/v2/apps/#{process.guid}/env"
+          get "/v2/apps/#{app_model.guid}/env"
 
           expect(last_response.status).to eq(200)
           expect(decoded_response['application_env_json']).to match({
@@ -1563,7 +1576,7 @@ module VCAP::CloudController
 
           it 'raises 403 for space developers' do
             set_current_user(developer)
-            get "/v2/apps/#{process.guid}/env"
+            get "/v2/apps/#{app_model.guid}/env"
 
             expect(last_response.status).to eq(403)
             expect(last_response.body).to include('Feature Disabled: space_developer_env_var_visibility')
@@ -1582,7 +1595,7 @@ module VCAP::CloudController
 
       context 'when app will be staged', isolation: :truncation do
         let(:process) do
-          ProcessModelFactory.make(diego: false, state: 'STOPPED', instances: 1).tap do |p|
+          ProcessModelFactory.make(diego: false, state: 'STOPPED', instances: 1, app: app_model).tap do |p|
             p.current_droplet.destroy
             p.reload
           end
@@ -1599,25 +1612,25 @@ module VCAP::CloudController
         end
 
         it 'returns X-App-Staging-Log header with staging log url' do
-          put "/v2/apps/#{process.guid}", MultiJson.dump(state: 'STARTED')
+          put "/v2/apps/#{app_model.guid}", MultiJson.dump(state: 'STARTED')
           expect(last_response.status).to eq(201), last_response.body
           expect(last_response.headers['X-App-Staging-Log']).to eq('streaming-log-url')
         end
       end
 
       context 'when app will not be staged' do
-        let(:process) { ProcessModelFactory.make(state: 'STOPPED') }
+        let(:process) { ProcessModelFactory.make(state: 'STOPPED', app: app_model) }
 
         it 'does not add X-App-Staging-Log' do
-          put "/v2/apps/#{process.guid}", MultiJson.dump({})
-          expect(last_response.status).to eq(201)
+          put "/v2/apps/#{app_model.guid}", MultiJson.dump({})
+          expect(last_response.status).to eq(201), last_response.body
           expect(last_response.headers).not_to have_key('X-App-Staging-Log')
         end
       end
     end
 
     describe 'downloading the droplet' do
-      let(:process) { ProcessModelFactory.make }
+      let(:process) { ProcessModelFactory.make(app: app_model) }
       let(:blob) { instance_double(CloudController::Blobstore::FogBlob) }
       let(:developer) { make_developer_for_space(process.space) }
 
@@ -1628,7 +1641,7 @@ module VCAP::CloudController
       end
 
       it 'should let the user download the droplet' do
-        get "/v2/apps/#{process.guid}/droplet/download", MultiJson.dump({})
+        get "/v2/apps/#{app_model.guid}/droplet/download", MultiJson.dump({})
         expect(last_response).to be_redirect
         expect(last_response.header['Location']).to eq('http://example.com/somewhere/else')
       end
@@ -1641,7 +1654,7 @@ module VCAP::CloudController
       it 'should return an error for an app without a droplet' do
         process.current_droplet.destroy
 
-        get "/v2/apps/#{process.guid}/droplet/download", MultiJson.dump({})
+        get "/v2/apps/#{app_model.guid}/droplet/download", MultiJson.dump({})
         expect(last_response.status).to eq(404)
       end
     end
@@ -1651,7 +1664,8 @@ module VCAP::CloudController
         TestConfig.override(directories: { tmpdir: File.dirname(valid_zip.path) })
       end
 
-      let(:process) { ProcessModel.make }
+      let(:app_model) { AppModel.make }
+      let!(:process) { ProcessModel.make(app: app_model, type: 'web') }
 
       let(:tmpdir) { Dir.mktmpdir }
       after { FileUtils.rm_rf(tmpdir) }
@@ -1668,9 +1682,9 @@ module VCAP::CloudController
 
         it 'is allowed' do
           set_current_user(User.make, admin: true)
-          put "/v2/apps/#{process.guid}/droplet/upload", req_body
+          put "/v2/apps/#{app_model.guid}/droplet/upload", req_body
 
-          expect(last_response.status).to eq(201)
+          expect(last_response.status).to eq(201), last_response.body
         end
       end
 
@@ -1680,7 +1694,7 @@ module VCAP::CloudController
         context 'with an empty request' do
           it 'fails to upload' do
             set_current_user(user)
-            put "/v2/apps/#{process.guid}/droplet/upload", {}
+            put "/v2/apps/#{app_model.guid}/droplet/upload", {}
 
             expect(last_response.status).to eq(400)
             expect(JSON.parse(last_response.body)['description']).to include('missing :droplet_path')
@@ -1693,7 +1707,7 @@ module VCAP::CloudController
           it 'creates a delayed job' do
             set_current_user(user)
             expect {
-              put "/v2/apps/#{process.guid}/droplet/upload", req_body
+              put "/v2/apps/#{app_model.guid}/droplet/upload", req_body
               expect(last_response.status).to eq 201
             }.to change {
               Delayed::Job.count
@@ -1709,7 +1723,7 @@ module VCAP::CloudController
         let(:req_body) { { droplet: valid_zip } }
 
         it 'returns 403' do
-          put "/v2/apps/#{process.guid}/droplet/upload", req_body
+          put "/v2/apps/#{app_model.guid}/droplet/upload", req_body
           expect(last_response.status).to eq(403)
         end
       end
@@ -1720,7 +1734,7 @@ module VCAP::CloudController
       let(:domain) do
         PrivateDomain.make(name: 'jesse.cloud', owning_organization: space.organization)
       end
-      let(:process) { ProcessModelFactory.make(diego: false, state: 'STARTED') }
+      let(:process) { ProcessModelFactory.make(diego: false, state: 'STARTED', app: app_model) }
 
       before do
         FeatureFlag.create(name: 'diego_docker', enabled: true)
@@ -1737,8 +1751,8 @@ module VCAP::CloudController
         allow(V2::RouteMappingCreate).to receive(:new).with(anything, route, process, anything, instance_of(Steno::Logger)).and_return(fake_route_mapping_create)
         expect(fake_route_mapping_create).to receive(:add)
 
-        put "/v2/apps/#{process.guid}/routes/#{route.guid}", nil
-        expect(last_response.status).to eq(201)
+        put "/v2/apps/#{app_model.guid}/routes/#{route.guid}", nil
+        expect(last_response.status).to eq(201), last_response.body
       end
 
       context 'with Docker app' do
@@ -1798,7 +1812,7 @@ module VCAP::CloudController
         it 'does not return docker disabled message' do
           put "/v2/apps/#{started_process.guid}", MultiJson.dump(instances: 2)
 
-          expect(last_response.status).to eq(201)
+          expect(last_response.status).to eq(201), last_response.body
         end
       end
     end
@@ -1809,8 +1823,8 @@ module VCAP::CloudController
       end
 
       context 'when docker is disabled' do
-        let!(:stopped_process) { ProcessModelFactory.make(:docker, state: 'STOPPED', docker_image: 'docker-image') }
-        let!(:started_process) { ProcessModelFactory.make(:docker, state: 'STARTED', docker_image: 'docker-image') }
+        let!(:stopped_process) { ProcessModelFactory.make(:docker, state: 'STOPPED', docker_image: 'docker-image', type: 'web') }
+        let!(:started_process) { ProcessModelFactory.make(:docker, state: 'STARTED', docker_image: 'docker-image', type: 'web') }
 
         before do
           FeatureFlag.find(name: 'diego_docker').update(enabled: false)
@@ -1819,9 +1833,9 @@ module VCAP::CloudController
         it 'returns docker disabled message on start' do
           set_current_user(make_developer_for_space(stopped_process.space))
 
-          put "/v2/apps/#{stopped_process.guid}", MultiJson.dump(state: 'STARTED')
+          put "/v2/apps/#{stopped_process.app.guid}", MultiJson.dump(state: 'STARTED')
 
-          expect(last_response.status).to eq(400)
+          expect(last_response.status).to eq(400), last_response.body
           expect(last_response.body).to match /Docker support has not been enabled/
           expect(decoded_response['code']).to eq(320003)
         end
@@ -1829,7 +1843,7 @@ module VCAP::CloudController
         it 'does not return docker disabled message on stop' do
           set_current_user(make_developer_for_space(started_process.space))
 
-          put "/v2/apps/#{started_process.guid}", MultiJson.dump(state: 'STOPPED')
+          put "/v2/apps/#{started_process.app.guid}", MultiJson.dump(state: 'STOPPED')
 
           expect(last_response.status).to eq(201)
         end
@@ -1921,7 +1935,7 @@ module VCAP::CloudController
 
     describe 'Validation messages' do
       let(:space) { process.space }
-      let!(:process) { ProcessModelFactory.make(state: 'STARTED') }
+      let!(:process) { ProcessModelFactory.make(state: 'STARTED', app: app_model) }
 
       before do
         set_current_user(make_developer_for_space(space))
@@ -1929,7 +1943,7 @@ module VCAP::CloudController
 
       it 'returns duplicate app name message correctly' do
         existing_process = ProcessModel.make(app: AppModel.make(space: space))
-        put "/v2/apps/#{process.guid}", MultiJson.dump(name: existing_process.name)
+        put "/v2/apps/#{app_model.guid}", MultiJson.dump(name: existing_process.name)
 
         expect(last_response.status).to eq(400)
         expect(decoded_response['code']).to eq(100002)
@@ -1961,7 +1975,7 @@ module VCAP::CloudController
         space.space_quota_definition = SpaceQuotaDefinition.make(memory_limit: 0)
         space.save(validate: false)
 
-        put "/v2/apps/#{process.guid}", MultiJson.dump(memory: 128)
+        put "/v2/apps/#{app_model.guid}", MultiJson.dump(memory: 128)
 
         expect(last_response.status).to eq(400)
         expect(decoded_response['code']).to eq(310003)
@@ -2010,7 +2024,7 @@ module VCAP::CloudController
         space.space_quota_definition = SpaceQuotaDefinition.make(instance_memory_limit: 100)
         space.save(validate: false)
 
-        put "/v2/apps/#{process.guid}", MultiJson.dump(memory: 128)
+        put "/v2/apps/#{app_model.guid}", MultiJson.dump(memory: 128)
 
         expect(last_response.status).to eq(400)
         expect(decoded_response['code']).to eq(310004)
@@ -2025,9 +2039,9 @@ module VCAP::CloudController
       end
 
       it 'returns state invalid message correctly' do
-        put "/v2/apps/#{process.guid}", MultiJson.dump(state: 'mississippi')
+        put "/v2/apps/#{app_model.guid}", MultiJson.dump(state: 'mississippi')
 
-        expect(last_response.status).to eq(400)
+        expect(last_response.status).to eq(400), last_response.body
         expect(last_response.body).to match /Invalid app state provided/
         expect(decoded_response['code']).to eq(100001)
       end
@@ -2044,23 +2058,35 @@ module VCAP::CloudController
     end
 
     describe 'enumerate' do
-      let!(:web_app) { ProcessModel.make(type: 'web') }
-      let!(:other_app) { ProcessModel.make(type: 'other') }
+      let!(:web_app) do
+        app = AppModel.make
+        ProcessModel.make(type: 'web', app: app)
+        app
+      end
+      let!(:other_app) do
+        app = AppModel.make
+        ProcessModel.make(type: 'other', app: app)
+        app
+      end
 
       before do
         set_current_user_as_admin
       end
 
-      it 'displays apps with type web' do
+      it 'displays apps with web processes' do
         get '/v2/apps'
-        expect(decoded_response['total_results']).to eq(1)
+
+        expect(last_response.status).to eq(200), last_response.body
+
+        expect(decoded_response['total_results']).to eq(1), decoded_response
         expect(decoded_response['resources'][0]['metadata']['guid']).to eq(web_app.guid)
       end
     end
 
     describe 'PUT /v2/apps/:app_guid/routes/:route_guid' do
       let(:space) { Space.make }
-      let(:process) { ProcessModelFactory.make(space: space) }
+      let(:app_model) { AppModel.make(space: space) }
+      let(:process) { ProcessModelFactory.make(space: space, app: app_model) }
       let(:route) { Route.make(space: space) }
       let(:developer) { make_developer_for_space(space) }
 
@@ -2071,7 +2097,7 @@ module VCAP::CloudController
       it 'adds the route to the app' do
         expect(process.reload.routes).to be_empty
 
-        put "/v2/apps/#{process.guid}/routes/#{route.guid}", nil
+        put "/v2/apps/#{app_model.guid}/routes/#{route.guid}", nil
 
         expect(last_response).to have_status_code(201)
         expect(process.reload.routes).to match_array([route])
@@ -2091,7 +2117,7 @@ module VCAP::CloudController
 
       context 'when the route does not exist' do
         it 'returns 404' do
-          put "/v2/apps/#{process.guid}/routes/not-real", nil
+          put "/v2/apps/#{app_model.guid}/routes/not-real", nil
           expect(last_response).to have_status_code(404)
           expect(last_response.body).to include('RouteNotFound')
         end
@@ -2127,7 +2153,7 @@ module VCAP::CloudController
         it 'raises an error' do
           expect(process.reload.routes).to be_empty
 
-          put "/v2/apps/#{process.guid}/routes/#{route.guid}", nil
+          put "/v2/apps/#{app_model.guid}/routes/#{route.guid}", nil
           expect(last_response.status).to eq(400)
           expect(last_response.body).to include('InvalidRelation')
           expect(decoded_response['description']).to include(
@@ -2138,7 +2164,7 @@ module VCAP::CloudController
       end
 
       context 'when the app has multiple ports' do
-        let(:process) { ProcessModelFactory.make(diego: true, space: route.space, ports: [9797, 7979]) }
+        let(:process) { ProcessModelFactory.make(diego: true, space: route.space, ports: [9797, 7979], app: app_model) }
 
         it 'uses the first port for the app as the app_port' do
           put "/v2/apps/#{process.guid}/routes/#{route.guid}", nil
@@ -2163,7 +2189,7 @@ module VCAP::CloudController
         it 'adds the route to the app' do
           expect(process.reload.routes).to be_empty
 
-          put "/v2/apps/#{process.guid}/routes/#{route.guid}", nil
+          put "/v2/apps/#{app_model.guid}/routes/#{route.guid}", nil
 
           expect(last_response).to have_status_code(201)
           expect(process.reload.routes).to match_array([route])
@@ -2180,7 +2206,7 @@ module VCAP::CloudController
           end
 
           it 'existing routes with router groups return 403 when mapped to apps' do
-            put "/v2/apps/#{process.guid}/routes/#{route.guid}", nil
+            put "/v2/apps/#{app_model.guid}/routes/#{route.guid}", nil
             expect(last_response).to have_status_code(403)
             expect(decoded_response['description']).to include('Routing API is disabled')
           end
@@ -2190,7 +2216,8 @@ module VCAP::CloudController
 
     describe 'DELETE /v2/apps/:app_guid/routes/:route_guid' do
       let(:space) { Space.make }
-      let(:process) { ProcessModelFactory.make(space: space) }
+      let(:app_model) { AppModel.make(space: space) }
+      let(:process) { ProcessModelFactory.make(space: space, app: app_model) }
       let(:route) { Route.make(space: space) }
       let!(:route_mapping) { RouteMappingModel.make(app: process.app, route: route, process_type: process.type) }
       let(:developer) { make_developer_for_space(space) }
@@ -2202,7 +2229,7 @@ module VCAP::CloudController
       it 'removes the association' do
         expect(process.reload.routes).to match_array([route])
 
-        delete "/v2/apps/#{process.guid}/routes/#{route.guid}"
+        delete "/v2/apps/#{app_model.guid}/routes/#{route.guid}"
         expect(last_response.status).to eq(204)
 
         expect(process.reload.routes).to be_empty
@@ -2218,7 +2245,7 @@ module VCAP::CloudController
 
       context 'when the route does not exist' do
         it 'returns 404' do
-          delete "/v2/apps/#{process.guid}/routes/not-found"
+          delete "/v2/apps/#{app_model.guid}/routes/not-found"
           expect(last_response).to have_status_code(404)
           expect(last_response.body).to include('RouteNotFound')
         end
@@ -2330,7 +2357,7 @@ module VCAP::CloudController
 
     describe 'DELETE /v2/apps/:app_guid/service_bindings/:service_binding_guid' do
       let(:space) { Space.make }
-      let(:process) { ProcessModelFactory.make(space: space) }
+      let(:process) { ProcessModelFactory.make(space: space, app: app_model) }
       let(:instance) { ManagedServiceInstance.make(space: space) }
       let!(:service_binding) { ServiceBinding.make(app: process.app, service_instance: instance) }
       let(:developer) { make_developer_for_space(space) }
@@ -2343,7 +2370,7 @@ module VCAP::CloudController
       it 'removes the association' do
         expect(process.reload.service_bindings).to match_array([service_binding])
 
-        delete "/v2/apps/#{process.guid}/service_bindings/#{service_binding.guid}"
+        delete "/v2/apps/#{app_model.guid}/service_bindings/#{service_binding.guid}"
         expect(last_response.status).to eq(204)
 
         expect(process.reload.service_bindings).to be_empty
@@ -2364,7 +2391,7 @@ module VCAP::CloudController
 
       context 'when the service binding does not exist' do
         it 'returns 404' do
-          delete "/v2/apps/#{process.guid}/service_bindings/not-found"
+          delete "/v2/apps/#{app_model.guid}/service_bindings/not-found"
           expect(last_response).to have_status_code(404)
           expect(last_response.body).to include('ServiceBindingNotFound')
         end
@@ -2376,14 +2403,15 @@ module VCAP::CloudController
         end
 
         it 'returns 403' do
-          delete "/v2/apps/#{process.guid}/service_bindings/#{service_binding.guid}"
+          delete "/v2/apps/#{app_model.guid}/service_bindings/#{service_binding.guid}"
           expect(last_response).to have_status_code(403)
         end
       end
     end
 
     describe 'GET /v2/apps/:guid/permissions' do
-      let(:process) { ProcessModelFactory.make(space: space) }
+      let(:app_model) { AppModel.make(space: space) }
+      let(:process) { ProcessModelFactory.make(space: space, app: app_model) }
       let(:space) { Space.make }
       let(:user) { User.make }
 
@@ -2398,7 +2426,7 @@ module VCAP::CloudController
         end
 
         it 'succeeds and present data reading permissions' do
-          get "/v2/apps/#{process.guid}/permissions"
+          get "/v2/apps/#{app_model.guid}/permissions"
           expect(last_response.status).to eq(200)
           expect(parsed_response['read_sensitive_data']).to eq(true)
           expect(parsed_response['read_basic_data']).to eq(true)
@@ -2456,7 +2484,7 @@ module VCAP::CloudController
         end
 
         it 'succeeds and present data reading permissions' do
-          get "/v2/apps/#{process.guid}/permissions"
+          get "/v2/apps/#{app_model.guid}/permissions"
           expect(last_response.status).to eq(200)
           expect(parsed_response['read_sensitive_data']).to eq(false)
           expect(parsed_response['read_basic_data']).to eq(true)
@@ -2497,7 +2525,7 @@ module VCAP::CloudController
         end
 
         it 'returns 403' do
-          get "/v2/apps/#{process.guid}/permissions"
+          get "/v2/apps/#{app_model.guid}/permissions"
           expect(last_response.status).to eq(403)
           expect(decoded_response['code']).to eq(10003)
           expect(decoded_response['error_code']).to eq('CF-NotAuthorized')
